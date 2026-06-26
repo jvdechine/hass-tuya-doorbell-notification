@@ -94,14 +94,21 @@ const getTuyaToken = async () => {
 
 const downloadPhoto = async (bucket, filePath) => {
     const token = await getTuyaToken();
-    const params = `bucket=${encodeURIComponent(bucket)}&path=${encodeURIComponent(filePath)}`;
-    const urlPath = `/v1.0/iot-03/files/media/download?${params}`;
+    const params = `bucket=${encodeURIComponent(bucket)}&file_path=${encodeURIComponent(filePath)}`;
+    const urlPath = `/v1.0/devices/${config.devId}/movement-configs?${params}`;
     const r = await tuyaApiCall('GET', urlPath, token);
     if (!r.success) throw new Error('Falha no download URL: ' + JSON.stringify(r));
-    const signedUrl = r.result.url;
+    
+    const signedUrl = r.result;  // resposta é a URL diretamente, não um objeto
+    if (typeof signedUrl !== 'string') {
+        throw new Error('URL inesperada: ' + JSON.stringify(r.result));
+    }
+    
+    const isHttps = signedUrl.startsWith('https:');
+    const fetcher = isHttps ? https : http;
     
     return new Promise((resolve, reject) => {
-        https.get(signedUrl, (res) => {
+        fetcher.get(signedUrl, (res) => {
             if (res.statusCode !== 200) {
                 reject(new Error('Download HTTP ' + res.statusCode));
                 return;
@@ -112,6 +119,19 @@ const downloadPhoto = async (bucket, filePath) => {
             res.on('error', reject);
         }).on('error', reject);
     });
+};
+
+// Descriptografia AES-CBC + PKCS5 (chave por-arquivo de 16 chars)
+const decryptPhoto = (encryptedBuffer, key) => {
+    const keyBuf = Buffer.from(key, 'utf-8');
+    if (keyBuf.length !== 16) {
+        throw new Error('Chave precisa ter 16 bytes, tem ' + keyBuf.length);
+    }
+    // IV zerado é o padrão da Tuya pra arquivos de detecção
+    const iv = Buffer.alloc(16, 0);
+    const decipher = crypto.createDecipheriv('aes-128-cbc', keyBuf, iv);
+    decipher.setAutoPadding(true);
+    return Buffer.concat([decipher.update(encryptedBuffer), decipher.final()]);
 };
 
 const SERVERS = {
@@ -224,9 +244,20 @@ const handleMessage = async (decodedMessage) => {
     
     // Tenta baixar a foto (Fase 1: SEM descriptografia)
     try {
-        const photoBuffer = await downloadPhoto(bucket, filePath);
-        fs.writeFileSync(localPath, photoBuffer);
-        console.log(`Foto salva: ${localPath} (${photoBuffer.length} bytes)`);
+        const encryptedBuffer = await downloadPhoto(bucket, filePath);
+        console.log(`Baixou ${encryptedBuffer.length} bytes (criptografado)`);
+        
+        let finalBuffer = encryptedBuffer;
+        try {
+            finalBuffer = decryptPhoto(encryptedBuffer, decryptKey);
+            console.log(`Descriptografou: ${finalBuffer.length} bytes`);
+        } catch (e) {
+            console.error('Falha ao descriptografar (salvando cifrado):', e.message);
+            // salva cifrado mesmo, pra você inspecionar
+        }
+        
+        fs.writeFileSync(localPath, finalBuffer);
+        console.log(`Foto salva: ${localPath}`);
     } catch (e) {
         console.error('Falha ao baixar foto:', e.message);
     }
