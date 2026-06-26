@@ -73,15 +73,46 @@ const notifyHass = (payload) => {
 }
 
 const handleMessage = (decodedMessage) => {
-    console.log('=== MSG RECEBIDA ===');
-    console.log(JSON.stringify(decodedMessage?.payload?.data, null, 2));
-    console.log('====================');
-    if (decodedMessage?.payload?.data?.devId == config.devId && decodedMessage?.payload?.data?.bizCode === 'event_notify') {
-        if (process.env.DEBUG) {
-            console.log(decodedMessage?.payload?.data, { messageId: decodedMessage.messageId });
-        }
-        notifyHass(decodedMessage?.payload?.data);
+    const data = decodedMessage?.payload?.data;
+    
+    if (data?.bizData?.devId !== config.devId) return;
+    if (data?.bizCode !== 'devicePropertyMessage') return;
+    
+    const props = data?.bizData?.properties || [];
+    const ring = props.find(p => p.code === 'initiative_message');
+    
+    if (!ring) return;
+    
+    // Decodifica o payload base64 do toque pra extrair a foto
+    let pictureInfo = null;
+    try {
+        const decoded = Buffer.from(ring.value, 'base64').toString('utf-8');
+        pictureInfo = JSON.parse(decoded);
+    } catch (e) {
+        console.error('Falha ao decodificar initiative_message:', e.message);
     }
+    
+    // Só dispara se for evento de campainha (cmd: ipc_doorbell)
+    if (pictureInfo?.cmd !== 'ipc_doorbell') {
+        if (process.env.DEBUG) console.log('Evento ignorado (não é toque):', pictureInfo?.cmd);
+        return;
+    }
+    
+    console.log('>>> CAMPAINHA TOCOU <<<', { 
+        time: pictureInfo.time,
+        file: pictureInfo.files?.[0]?.[0],
+        messageId: decodedMessage.messageId 
+    });
+    
+    // Manda payload enxuto pro HA
+    notifyHass({
+        devId: data.bizData.devId,
+        event: 'doorbell_ring',
+        time: pictureInfo.time,
+        picture_path: pictureInfo.files?.[0]?.[0] || null,
+        picture_key: pictureInfo.files?.[0]?.[1] || null,
+        bucket: pictureInfo.bucket
+    });
 }
 
 const ackMessage = (ws, messageId) => {
