@@ -6,6 +6,114 @@ const http = require('http');
 let ws;
 let pingInterval;
 
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const SERVE_PORT = parseInt(process.env.SERVE_PORT || '3000', 10);
+const PHOTOS_DIR = '/app/photos';
+
+const TUYA_API_HOSTS = {
+    CN: 'openapi.tuyacn.com',
+    US: 'openapi.tuyaus.com',
+    EU: 'openapi.tuyaeu.com',
+    IN: 'openapi.tuyain.com',
+};
+const tuyaApiHost = TUYA_API_HOSTS[process.env.TUYA_REGION?.toUpperCase()];
+
+let tuyaToken = null;
+let tuyaTokenExpiry = 0;
+
+// Garante a pasta
+if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+
+// === HTTP server pra servir as fotos pro HA ===
+http.createServer((req, res) => {
+    const filename = path.basename(req.url);
+    const filepath = path.join(PHOTOS_DIR, filename);
+    if (!fs.existsSync(filepath)) {
+        res.writeHead(404); res.end('Not found'); return;
+    }
+    res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+    fs.createReadStream(filepath).pipe(res);
+}).listen(SERVE_PORT, () => {
+    console.log(`Servidor de fotos rodando na porta ${SERVE_PORT}`);
+});
+
+// === Assinatura Tuya Cloud API ===
+const sha256 = (str) => crypto.createHash('sha256').update(str).digest('hex');
+const hmacSha256 = (str, key) => crypto.createHmac('sha256', key).update(str).digest('hex').toUpperCase();
+
+const tuyaSign = (method, urlPath, accessToken, body = '') => {
+    const t = Date.now().toString();
+    const contentSha = sha256(body);
+    const stringToSign = `${method}\n${contentSha}\n\n${urlPath}`;
+    const signStr = config.accessId + (accessToken || '') + t + stringToSign;
+    return {
+        sign: hmacSha256(signStr, config.accessKey),
+        t,
+    };
+};
+
+const tuyaApiCall = (method, urlPath, accessToken = '', body = '') => {
+    return new Promise((resolve, reject) => {
+        const { sign, t } = tuyaSign(method, urlPath, accessToken, body);
+        const req = https.request({
+            hostname: tuyaApiHost,
+            method,
+            path: urlPath,
+            headers: {
+                'client_id': config.accessId,
+                'sign': sign,
+                't': t,
+                'sign_method': 'HMAC-SHA256',
+                ...(accessToken ? { 'access_token': accessToken } : {}),
+                'Content-Type': 'application/json',
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        if (body) req.write(body);
+        req.end();
+    });
+};
+
+const getTuyaToken = async () => {
+    if (tuyaToken && Date.now() < tuyaTokenExpiry) return tuyaToken;
+    const r = await tuyaApiCall('GET', '/v1.0/token?grant_type=1');
+    if (!r.success) throw new Error('Falha no token: ' + JSON.stringify(r));
+    tuyaToken = r.result.access_token;
+    tuyaTokenExpiry = Date.now() + (r.result.expire_time - 60) * 1000;
+    return tuyaToken;
+};
+
+const downloadPhoto = async (bucket, filePath) => {
+    const token = await getTuyaToken();
+    const params = `bucket=${encodeURIComponent(bucket)}&path=${encodeURIComponent(filePath)}`;
+    const urlPath = `/v1.0/iot-03/files/media/download?${params}`;
+    const r = await tuyaApiCall('GET', urlPath, token);
+    if (!r.success) throw new Error('Falha no download URL: ' + JSON.stringify(r));
+    const signedUrl = r.result.url;
+    
+    return new Promise((resolve, reject) => {
+        https.get(signedUrl, (res) => {
+            if (res.statusCode !== 200) {
+                reject(new Error('Download HTTP ' + res.statusCode));
+                return;
+            }
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+        }).on('error', reject);
+    });
+};
+
 const SERVERS = {
     CN: 'wss://mqe.tuyacn.com:8285/',
     US: 'wss://mqe.tuyaus.com:8285/',
@@ -88,48 +196,49 @@ const notifyHass = (payload) => {
     request.end();
 }
 
-const handleMessage = (decodedMessage) => {
+const handleMessage = async (decodedMessage) => {
     const data = decodedMessage?.payload?.data;
-    
     if (data?.bizData?.devId !== config.devId) return;
     if (data?.bizCode !== 'devicePropertyMessage') return;
     
     const props = data?.bizData?.properties || [];
     const ring = props.find(p => p.code === 'initiative_message');
-    
     if (!ring) return;
     
-    // Decodifica o payload base64 do toque pra extrair a foto
     let pictureInfo = null;
     try {
-        const decoded = Buffer.from(ring.value, 'base64').toString('utf-8');
-        pictureInfo = JSON.parse(decoded);
+        pictureInfo = JSON.parse(Buffer.from(ring.value, 'base64').toString('utf-8'));
     } catch (e) {
         console.error('Falha ao decodificar initiative_message:', e.message);
-    }
-    
-    // Só dispara se for evento de campainha (cmd: ipc_doorbell)
-    if (pictureInfo?.cmd !== 'ipc_doorbell') {
-        if (process.env.DEBUG) console.log('Evento ignorado (não é toque):', pictureInfo?.cmd);
         return;
     }
+    if (pictureInfo?.cmd !== 'ipc_doorbell') return;
     
-    console.log('>>> CAMPAINHA TOCOU <<<', { 
-        time: pictureInfo.time,
-        file: pictureInfo.files?.[0]?.[0],
-        messageId: decodedMessage.messageId 
-    });
+    const bucket = pictureInfo.bucket;
+    const filePath = pictureInfo.files?.[0]?.[0];
+    const decryptKey = pictureInfo.files?.[0]?.[1];
+    const filename = `${pictureInfo.time}.jpg`;
+    const localPath = path.join(PHOTOS_DIR, filename);
     
-    // Manda payload enxuto pro HA
+    console.log('>>> CAMPAINHA TOCOU <<<', { time: pictureInfo.time, file: filePath });
+    
+    // Tenta baixar a foto (Fase 1: SEM descriptografia)
+    try {
+        const photoBuffer = await downloadPhoto(bucket, filePath);
+        fs.writeFileSync(localPath, photoBuffer);
+        console.log(`Foto salva: ${localPath} (${photoBuffer.length} bytes)`);
+    } catch (e) {
+        console.error('Falha ao baixar foto:', e.message);
+    }
+    
     notifyHass({
         devId: data.bizData.devId,
         event: 'doorbell_ring',
         time: pictureInfo.time,
-        picture_path: pictureInfo.files?.[0]?.[0] || null,
-        picture_key: pictureInfo.files?.[0]?.[1] || null,
-        bucket: pictureInfo.bucket
+        picture_filename: filename,
+        decrypt_key: decryptKey,
     });
-}
+};
 
 const ackMessage = (ws, messageId) => {
     ws.send(JSON.stringify({ messageId }));
