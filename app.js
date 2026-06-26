@@ -2,137 +2,12 @@ const WebSocket = require('ws');
 const { MD5, AES, enc, mode, pad } = require('crypto-js');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 let ws;
 let pingInterval;
-
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-
-const SERVE_PORT = parseInt(process.env.SERVE_PORT || '3000', 10);
-const PHOTOS_DIR = '/app/photos';
-
-const TUYA_API_HOSTS = {
-    CN: 'openapi.tuyacn.com',
-    US: 'openapi.tuyaus.com',
-    EU: 'openapi.tuyaeu.com',
-    IN: 'openapi.tuyain.com',
-};
-const tuyaApiHost = TUYA_API_HOSTS[process.env.TUYA_REGION?.toUpperCase()];
-
-let tuyaToken = null;
-let tuyaTokenExpiry = 0;
-
-// Garante a pasta
-if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
-
-// === HTTP server pra servir as fotos pro HA ===
-http.createServer((req, res) => {
-    const filename = path.basename(req.url);
-    const filepath = path.join(PHOTOS_DIR, filename);
-    if (!fs.existsSync(filepath)) {
-        res.writeHead(404); res.end('Not found'); return;
-    }
-    res.writeHead(200, { 'Content-Type': 'image/jpeg' });
-    fs.createReadStream(filepath).pipe(res);
-}).listen(SERVE_PORT, () => {
-    console.log(`Servidor de fotos rodando na porta ${SERVE_PORT}`);
-});
-
-// === Assinatura Tuya Cloud API ===
-const sha256 = (str) => crypto.createHash('sha256').update(str).digest('hex');
-const hmacSha256 = (str, key) => crypto.createHmac('sha256', key).update(str).digest('hex').toUpperCase();
-
-const tuyaSign = (method, urlPath, accessToken, body = '') => {
-    const t = Date.now().toString();
-    const contentSha = sha256(body);
-    const stringToSign = `${method}\n${contentSha}\n\n${urlPath}`;
-    const signStr = config.accessId + (accessToken || '') + t + stringToSign;
-    return {
-        sign: hmacSha256(signStr, config.accessKey),
-        t,
-    };
-};
-
-const tuyaApiCall = (method, urlPath, accessToken = '', body = '') => {
-    return new Promise((resolve, reject) => {
-        const { sign, t } = tuyaSign(method, urlPath, accessToken, body);
-        const req = https.request({
-            hostname: tuyaApiHost,
-            method,
-            path: urlPath,
-            headers: {
-                'client_id': config.accessId,
-                'sign': sign,
-                't': t,
-                'sign_method': 'HMAC-SHA256',
-                ...(accessToken ? { 'access_token': accessToken } : {}),
-                'Content-Type': 'application/json',
-            },
-        }, (res) => {
-            let data = '';
-            res.on('data', c => data += c);
-            res.on('end', () => {
-                try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-            });
-        });
-        req.on('error', reject);
-        if (body) req.write(body);
-        req.end();
-    });
-};
-
-const getTuyaToken = async () => {
-    if (tuyaToken && Date.now() < tuyaTokenExpiry) return tuyaToken;
-    const r = await tuyaApiCall('GET', '/v1.0/token?grant_type=1');
-    if (!r.success) throw new Error('Falha no token: ' + JSON.stringify(r));
-    tuyaToken = r.result.access_token;
-    tuyaTokenExpiry = Date.now() + (r.result.expire_time - 60) * 1000;
-    return tuyaToken;
-};
-
-const downloadPhoto = async (bucket, filePath) => {
-    const token = await getTuyaToken();
-    const params = `bucket=${encodeURIComponent(bucket)}&file_path=${encodeURIComponent(filePath)}`;
-    const urlPath = `/v1.0/devices/${config.devId}/movement-configs?${params}`;
-    const r = await tuyaApiCall('GET', urlPath, token);
-    if (!r.success) throw new Error('Falha no download URL: ' + JSON.stringify(r));
-    
-    const signedUrl = r.result;  // resposta é a URL diretamente, não um objeto
-    if (typeof signedUrl !== 'string') {
-        throw new Error('URL inesperada: ' + JSON.stringify(r.result));
-    }
-    
-    const isHttps = signedUrl.startsWith('https:');
-    const fetcher = isHttps ? https : http;
-    
-    return new Promise((resolve, reject) => {
-        fetcher.get(signedUrl, (res) => {
-            if (res.statusCode !== 200) {
-                reject(new Error('Download HTTP ' + res.statusCode));
-                return;
-            }
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-        }).on('error', reject);
-    });
-};
-
-// Descriptografia AES-CBC + PKCS5 (chave por-arquivo de 16 chars)
-const decryptPhoto = (encryptedBuffer, key) => {
-    const keyBuf = Buffer.from(key, 'utf-8');
-    if (keyBuf.length !== 16) {
-        throw new Error('Chave precisa ter 16 bytes, tem ' + keyBuf.length);
-    }
-    // IV zerado é o padrão da Tuya pra arquivos de detecção
-    const iv = Buffer.alloc(16, 0);
-    const decipher = crypto.createDecipheriv('aes-128-cbc', keyBuf, iv);
-    decipher.setAutoPadding(true);
-    return Buffer.concat([decipher.update(encryptedBuffer), decipher.final()]);
-};
 
 const SERVERS = {
     CN: 'wss://mqe.tuyacn.com:8285/',
@@ -140,203 +15,265 @@ const SERVERS = {
     EU: 'wss://mqe.tuyaeu.com:8285/',
     IN: 'wss://mqe.tuyain.com:8285/',
 };
+const API_HOSTS = {
+    CN: 'openapi.tuyacn.com',
+    US: 'openapi.tuyaus.com',
+    EU: 'openapi.tuyaeu.com',
+    IN: 'openapi.tuyain.com',
+};
 
 const config = {
     accessId: process.env.TUYA_CLIENT_ID,
     accessKey: process.env.TUYA_CLIENT_SECRET,
     url: SERVERS[process.env.TUYA_REGION?.toUpperCase()],
+    apiHost: API_HOSTS[process.env.TUYA_REGION?.toUpperCase()],
     devId: process.env.DOORBELL_DEVICE_ID,
     hassUrl: process.env.HASS_WEBHOOK_URL,
+    servePort: parseInt(process.env.SERVE_PORT || '3000', 10),
+    photosDir: '/app/photos',
     subscriptionType: 'Failover',
     ackTimeoutMillis: 1000,
-    isStartUp: true
+    isStartUp: true,
 };
 
-const buildTopicUrl = (websocketUrl, accessId, query) => {
-    return `${websocketUrl}ws/v2/consumer/persistent/${accessId}/out/event/${accessId}-sub${query}`;
-}
+let tuyaToken = null;
+let tuyaTokenExpiry = 0;
 
-const buildQuery = (query) => {
-    return Object.keys(query).map((key) => `${key}=${encodeURIComponent(query[key])}`).join('&');
-}
+// === Pasta de fotos + servidor HTTP que serve elas pro HA ===
+if (!fs.existsSync(config.photosDir)) fs.mkdirSync(config.photosDir, { recursive: true });
 
+http.createServer((req, res) => {
+    const filename = path.basename(req.url || '');
+    const filepath = path.join(config.photosDir, filename);
+    if (!filepath.startsWith(config.photosDir) || !fs.existsSync(filepath)) {
+        res.writeHead(404); res.end('Not found'); return;
+    }
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' });
+    fs.createReadStream(filepath).pipe(res);
+}).listen(config.servePort, () => {
+    console.log(`Servidor de fotos: porta ${config.servePort}`);
+});
+
+// === Decoder das mensagens do Pulsar (igual original) ===
+const buildTopicUrl = (websocketUrl, accessId, query) =>
+    `${websocketUrl}ws/v2/consumer/persistent/${accessId}/out/event/${accessId}-sub${query}`;
+const buildQuery = (q) => Object.keys(q).map((k) => `${k}=${encodeURIComponent(q[k])}`).join('&');
 const buildPassword = (accessId, accessKey) => {
     const key = MD5(accessKey).toString();
     return MD5(`${accessId}${key}`).toString().substr(8, 16);
-}
-
+};
 const decryptData = (data, accessKey) => {
     try {
         const realKey = enc.Utf8.parse(accessKey.substring(8, 24));
-        const json = AES.decrypt(data, realKey, {
-            mode: mode.ECB,
-            padding: pad.Pkcs7,
-        });
-        const dataStr = enc.Utf8.stringify(json).toString();
-        return JSON.parse(dataStr);
-    } catch (e) {
-        return '';
-    }
-}
-
+        const json = AES.decrypt(data, realKey, { mode: mode.ECB, padding: pad.Pkcs7 });
+        return JSON.parse(enc.Utf8.stringify(json).toString());
+    } catch (e) { return ''; }
+};
 const decodeMessage = (data) => {
     const { payload, ...others } = JSON.parse(data);
     const pStr = Buffer.from(payload, 'base64').toString('utf-8');
     const pJson = JSON.parse(pStr);
     pJson.data = decryptData(pJson.data, config.accessKey);
     return { payload: pJson, ...others };
-}
+};
+
+// === Tuya Cloud API ===
+const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const hmacSha256 = (s, k) => crypto.createHmac('sha256', k).update(s).digest('hex').toUpperCase();
+
+const tuyaApiCall = (method, urlPath, token = '') => new Promise((resolve, reject) => {
+    const t = Date.now().toString();
+    const stringToSign = `${method}\n${sha256hex('')}\n\n${urlPath}`;
+    const signStr = config.accessId + token + t + stringToSign;
+    const sign = hmacSha256(signStr, config.accessKey);
+    const headers = {
+        client_id: config.accessId, sign, t,
+        sign_method: 'HMAC-SHA256', 'Content-Type': 'application/json',
+    };
+    if (token) headers.access_token = token;
+
+    const req = https.request({ hostname: config.apiHost, method, path: urlPath, headers }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('parse: ' + data.substring(0, 150))); } });
+    });
+    req.on('error', reject);
+    req.end();
+});
+
+const getTuyaToken = async () => {
+    if (tuyaToken && Date.now() < tuyaTokenExpiry) return tuyaToken;
+    const r = await tuyaApiCall('GET', '/v1.0/token?grant_type=1');
+    if (!r.success) throw new Error('Token: ' + JSON.stringify(r));
+    tuyaToken = r.result.access_token;
+    tuyaTokenExpiry = Date.now() + (r.result.expire_time - 60) * 1000;
+    return tuyaToken;
+};
+
+const downloadBinary = (url) => new Promise((resolve, reject) => {
+    const client = url.startsWith('https:') ? https : http;
+    const req = client.get(url, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302) {
+            return downloadBinary(res.headers.location).then(resolve).catch(reject);
+        }
+        if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+    });
+    req.on('error', reject);
+});
+
+// Pipeline: obter URL → baixar → parsear header → descriptografar → salvar JPEG
+const fetchAndDecryptPhoto = async (bucket, filePath, decryptKey) => {
+    const token = await getTuyaToken();
+    const params = `bucket=${encodeURIComponent(bucket)}&file_path=${encodeURIComponent(filePath)}`;
+    const r = await tuyaApiCall('GET', `/v1.0/devices/${config.devId}/movement-configs?${params}`, token);
+    if (!r.success) throw new Error('URL: ' + JSON.stringify(r));
+    
+    const blob = await downloadBinary(r.result);
+    if (blob.length < 64) throw new Error('Arquivo pequeno demais: ' + blob.length + ' bytes');
+    
+    // Header: [4 bytes version][16 bytes IV][44 bytes reservado][resto = ciphertext]
+    const iv = blob.subarray(4, 20);
+    const ciphertext = blob.subarray(64);
+    const key = Buffer.from(decryptKey, 'utf-8');
+    if (key.length !== 16) throw new Error('Chave tem ' + key.length + ' bytes (esperado 16)');
+    
+    // Tentamos as 3 estratégias até uma produzir JPEG válido
+    const tryDecrypt = (autoPad, prePad) => {
+        let input = ciphertext;
+        if (prePad) {
+            const padLen = 16 - (ciphertext.length % 16);
+            input = Buffer.concat([ciphertext, Buffer.alloc(padLen, padLen)]);
+        }
+        const d = crypto.createDecipheriv('aes-128-cbc', key, iv);
+        d.setAutoPadding(autoPad);
+        return Buffer.concat([d.update(input), d.final()]);
+    };
+    
+    const isJpeg = (b) => b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF;
+    
+    for (const [name, opts] of [
+        ['autopad-on', [true, false]],
+        ['autopad-off', [false, false]],
+        ['prepad-pkcs7', [false, true]],
+    ]) {
+        try {
+            const out = tryDecrypt(...opts);
+            if (isJpeg(out)) {
+                console.log(`  ✅ descriptografado [${name}]: ${out.length} bytes`);
+                return out;
+            }
+        } catch (e) { /* tenta a próxima */ }
+    }
+    throw new Error('Nenhuma estratégia produziu JPEG válido');
+};
 
 const notifyHass = (payload) => {
     const url = new URL(config.hassUrl);
     const isHttps = url.protocol === 'https:';
     const client = isHttps ? https : http;
-    
-    const options = {
+    const req = client.request({
         method: 'POST',
         hostname: url.hostname,
         port: url.port || (isHttps ? 443 : 80),
         path: url.pathname + url.search,
-        headers: {
-            'Content-Type': 'application/json'
-        }
-    };
-    
-    const request = client.request(options, (res) => {
-        if (process.env.DEBUG) {
-            console.log(`HA webhook respondeu: ${res.statusCode}`);
-        }
+        headers: { 'Content-Type': 'application/json' },
+    }, (res) => {
+        if (process.env.DEBUG) console.log(`HA webhook: ${res.statusCode}`);
     });
-    
-    request.on('error', (err) => {
-        console.error('Erro ao chamar webhook HA:', err.message);
-    });
-    
-    request.write(JSON.stringify(payload));
-    request.end();
-}
+    req.on('error', (e) => console.error('Webhook erro:', e.message));
+    req.write(JSON.stringify(payload));
+    req.end();
+};
 
 const handleMessage = async (decodedMessage) => {
     const data = decodedMessage?.payload?.data;
     if (data?.bizData?.devId !== config.devId) return;
     if (data?.bizCode !== 'devicePropertyMessage') return;
     
-    const props = data?.bizData?.properties || [];
-    const ring = props.find(p => p.code === 'initiative_message');
+    const ring = (data?.bizData?.properties || []).find(p => p.code === 'initiative_message');
     if (!ring) return;
     
-    let pictureInfo = null;
+    let pictureInfo;
     try {
         pictureInfo = JSON.parse(Buffer.from(ring.value, 'base64').toString('utf-8'));
-    } catch (e) {
-        console.error('Falha ao decodificar initiative_message:', e.message);
-        return;
-    }
+    } catch (e) { console.error('decode initiative_message:', e.message); return; }
+    
     if (pictureInfo?.cmd !== 'ipc_doorbell') return;
     
+    // Estrutura via Pulsar: files = [[path, key]]
+    const file = pictureInfo.files?.[0];
+    if (!Array.isArray(file)) {
+        console.error('formato inesperado de files:', JSON.stringify(pictureInfo.files));
+        return;
+    }
+    const [filePath, decryptKey] = file;
     const bucket = pictureInfo.bucket;
-    const filePath = pictureInfo.files?.[0]?.[0];
-    const decryptKey = pictureInfo.files?.[0]?.[1];
     const filename = `${pictureInfo.time}.jpg`;
-    const localPath = path.join(PHOTOS_DIR, filename);
+    const localPath = path.join(config.photosDir, filename);
     
     console.log('>>> CAMPAINHA TOCOU <<<', { time: pictureInfo.time, file: filePath });
     
-    // Tenta baixar a foto (Fase 1: SEM descriptografia)
-    try {
-        const encryptedBuffer = await downloadPhoto(bucket, filePath);
-        console.log(`Baixou ${encryptedBuffer.length} bytes (criptografado)`);
-        
-        let finalBuffer = encryptedBuffer;
-        try {
-            finalBuffer = decryptPhoto(encryptedBuffer, decryptKey);
-            console.log(`Descriptografou: ${finalBuffer.length} bytes`);
-        } catch (e) {
-            console.error('Falha ao descriptografar (salvando cifrado):', e.message);
-            // salva cifrado mesmo, pra você inspecionar
-        }
-        
-        fs.writeFileSync(localPath, finalBuffer);
-        console.log(`Foto salva: ${localPath}`);
-    } catch (e) {
-        console.error('Falha ao baixar foto:', e.message);
-    }
-    
+    // Dispara o webhook IMEDIATAMENTE (notificação rápida, sem foto)
     notifyHass({
         devId: data.bizData.devId,
         event: 'doorbell_ring',
         time: pictureInfo.time,
-        picture_filename: filename,
-        decrypt_key: decryptKey,
+        filename,  // o HA vai usar pra montar a URL da foto
     });
+    
+    // Baixa e descriptografa a foto em paralelo (não bloqueia o webhook)
+    try {
+        const jpeg = await fetchAndDecryptPhoto(bucket, filePath, decryptKey);
+        fs.writeFileSync(localPath, jpeg);
+        console.log(`  💾 ${localPath} (${jpeg.length} bytes)`);
+        
+        // Também salva como "ultimo.jpg" pra notificação simples
+        fs.writeFileSync(path.join(config.photosDir, 'ultimo.jpg'), jpeg);
+    } catch (e) {
+        console.error('Foto falhou:', e.message);
+    }
 };
 
-const ackMessage = (ws, messageId) => {
-    ws.send(JSON.stringify({ messageId }));
-}
+const ackMessage = (ws, messageId) => ws.send(JSON.stringify({ messageId }));
 
 const connect = () => {
-
-    const topicUrl = buildTopicUrl(config.url, config.accessId, `?${buildQuery({ subscriptionType: config.subscriptionType, ackTimeoutMillis: config.ackTimeoutMillis })}`)
-
+    const topicUrl = buildTopicUrl(config.url, config.accessId,
+        `?${buildQuery({ subscriptionType: config.subscriptionType, ackTimeoutMillis: config.ackTimeoutMillis })}`);
     const password = buildPassword(config.accessId, config.accessKey);
     const username = config.accessId;
-
-    const ws = new WebSocket(topicUrl, {
-        rejectUnauthorized: false,
-        headers: { username, password },
-    });
-
-    ws.on('error', () => {
-        clearInterval(pingInterval);
-        if(config.isStartUp) {
-            connect()
-        }
-    });
-    ws.on('open', () => {
-        pingInterval = setInterval(() => ws.ping() );
-    });
-    ws.on('close', () => {
-        clearInterval(pingInterval);
-        if(config.isStartUp) {
-            connect()
-        }
-    });
-
+    
+    const ws = new WebSocket(topicUrl, { rejectUnauthorized: false, headers: { username, password } });
+    
+    ws.on('error', () => { clearInterval(pingInterval); if (config.isStartUp) connect(); });
+    ws.on('open', () => { pingInterval = setInterval(() => ws.ping()); console.log('Pulsar conectado'); });
+    ws.on('close', () => { clearInterval(pingInterval); if (config.isStartUp) connect(); });
     ws.on('message', (data) => {
         const decodedMessage = decodeMessage(data);
-        handleMessage(decodedMessage);
+        handleMessage(decodedMessage).catch(e => console.error('handle:', e.message));
         ackMessage(ws, decodedMessage.messageId);
     });
     
     return ws;
-}
+};
 
 const main = () => {
-
-    const requiredEnvVariables = [ "TUYA_CLIENT_ID", "TUYA_CLIENT_SECRET", "TUYA_REGION", "DOORBELL_DEVICE_ID", "HASS_WEBHOOK_URL" ]
-    const invalidEnvVariables = [];
-    requiredEnvVariables.forEach(envVariable => {
-        if (!envVariable) {
-            invalidEnvVariables.push(envVariable);
-        }
-    });
-    if(invalidEnvVariables.length) {
-        throw (`Found these env variables to be invalid: ${invalidEnvVariables.join(', ')}`);
-    }
-
-    console.info(`All config env variables seem to exist`)
-
+    const required = ['TUYA_CLIENT_ID', 'TUYA_CLIENT_SECRET', 'TUYA_REGION', 'DOORBELL_DEVICE_ID', 'HASS_WEBHOOK_URL'];
+    const missing = required.filter(v => !process.env[v]);
+    if (missing.length) throw new Error('Faltam env vars: ' + missing.join(', '));
+    console.info('Config OK, conectando...');
     ws = connect();
 };
 
 main();
 
-const handleSignals = signalName => {
-    console.log(`Received code ${signalName}, closing gracefuly ...`);
+const handleSignals = (sig) => {
+    console.log('Sinal:', sig);
     config.isStartUp = false;
     ws.close();
     process.exit(0);
-}
-
-['SIGTERM', 'SIGINT', 'SIGPWR'].map(signal => process.once(signal, handleSignals));
+};
+['SIGTERM', 'SIGINT', 'SIGPWR'].forEach(s => process.once(s, handleSignals));
