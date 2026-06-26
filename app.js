@@ -73,6 +73,9 @@ const notifyHass = (payload) => {
 }
 
 const handleMessage = (decodedMessage) => {
+    console.log('=== MSG RECEBIDA ===');
+    console.log(JSON.stringify(decodedMessage?.payload?.data, null, 2));
+    console.log('====================');
     if (decodedMessage?.payload?.data?.devId == config.devId && decodedMessage?.payload?.data?.bizCode === 'event_notify') {
         if (process.env.DEBUG) {
             console.log(decodedMessage?.payload?.data, { messageId: decodedMessage.messageId });
