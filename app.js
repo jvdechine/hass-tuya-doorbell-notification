@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 const { MD5, AES, enc, mode, pad } = require('crypto-js');
 const https = require('https');
+const http = require('http');
 
 let ws;
 let pingInterval;
@@ -59,15 +60,30 @@ const decodeMessage = (data) => {
 }
 
 const notifyHass = (payload) => {
-    const endpointParts = config.hassUrl.split('/');
+    const url = new URL(config.hassUrl);
+    const isHttps = url.protocol === 'https:';
+    const client = isHttps ? https : http;
+    
     const options = {
-        protocol: endpointParts[0],
         method: 'POST',
-        hostname: endpointParts[2].split(':')[0],
-        port: endpointParts[2].split(':').length == 2 ? endpointParts[2].split(':')[1] : (endpointParts[0] == 'https:' ? 443 : 80),
-        path: `/${endpointParts.slice(3, endpointParts.length).join('/')}`,
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname + url.search,
+        headers: {
+            'Content-Type': 'application/json'
+        }
     };
-    const request = https.request(options);
+    
+    const request = client.request(options, (res) => {
+        if (process.env.DEBUG) {
+            console.log(`HA webhook respondeu: ${res.statusCode}`);
+        }
+    });
+    
+    request.on('error', (err) => {
+        console.error('Erro ao chamar webhook HA:', err.message);
+    });
+    
     request.write(JSON.stringify(payload));
     request.end();
 }
